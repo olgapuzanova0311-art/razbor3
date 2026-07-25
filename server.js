@@ -134,6 +134,7 @@ async function findContactByPhone(phone) {
   if (!phone) return null;
   const query = encodeURIComponent(phone);
   const data = await amoFetch(`/contacts?query=${query}&with=leads`);
+  if (!data) return null; // amoCRM отвечает 204 без тела, если ничего не найдено
   const contacts = data._embedded?.contacts || [];
   return contacts[0] || null;
 }

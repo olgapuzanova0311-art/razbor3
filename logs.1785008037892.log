@@ -1,0 +1,28 @@
+2026-07-25T19:26:24.794668711Z [inf]  Starting Container
+2026-07-25T19:30:34.832861295Z [inf]  Резолв воронки: {
+2026-07-25T19:30:34.832864115Z [inf]    pipelineId: 11139586,
+2026-07-25T19:30:34.832866455Z [inf]    statusId: 87445162,
+2026-07-25T19:30:34.832869185Z [inf]    pipelineName: 'Разборы',
+2026-07-25T19:30:34.832872635Z [inf]    stageName: 'Первичный контакт'
+2026-07-25T19:30:34.832875065Z [inf]  }
+2026-07-25T19:30:34.832877965Z [inf]  OK: сделка #66112271 создана для Тест Тестов (+79990001122)
+2026-07-25T19:31:24.857556942Z [err]  Ошибка обработки заявки: TypeError: Cannot read properties of null (reading '_embedded')
+2026-07-25T19:31:24.857559712Z [err]      at findContactByPhone (/app/server.js:93:25)
+2026-07-25T19:31:24.857562402Z [err]      at process.processTicksAndRejections (node:internal/process/task_queues:95:5)
+2026-07-25T19:31:24.857567492Z [err]      at async /app/server.js:166:19
+2026-07-25T19:32:44.955943496Z [err]  Ошибка обработки заявки: TypeError: Cannot read properties of null (reading '_embedded')
+2026-07-25T19:32:44.955947046Z [err]      at findContactByPhone (/app/server.js:93:25)
+2026-07-25T19:32:44.955949906Z [err]      at process.processTicksAndRejections (node:internal/process/task_queues:95:5)
+2026-07-25T19:32:44.955953066Z [err]      at async /app/server.js:166:19
+2026-07-25T19:32:51.847730442Z [err]  Ошибка обработки заявки: TypeError: Cannot read properties of null (reading '_embedded')
+2026-07-25T19:32:51.847735412Z [err]      at findContactByPhone (/app/server.js:93:25)
+2026-07-25T19:32:51.847739172Z [err]      at process.processTicksAndRejections (node:internal/process/task_queues:95:5)
+2026-07-25T19:32:51.847742692Z [err]      at async /app/server.js:166:19
+2026-07-25T19:32:53.204045479Z [err]  Ошибка обработки заявки: TypeError: Cannot read properties of null (reading '_embedded')
+2026-07-25T19:32:53.204048679Z [err]      at findContactByPhone (/app/server.js:93:25)
+2026-07-25T19:32:53.204051779Z [err]      at process.processTicksAndRejections (node:internal/process/task_queues:95:5)
+2026-07-25T19:32:53.204054218Z [err]      at async /app/server.js:166:19
+2026-07-25T19:33:13.205273011Z [err]  Ошибка обработки заявки: TypeError: Cannot read properties of null (reading '_embedded')
+2026-07-25T19:33:13.205278741Z [err]      at findContactByPhone (/app/server.js:93:25)
+2026-07-25T19:33:13.205282101Z [err]      at process.processTicksAndRejections (node:internal/process/task_queues:95:5)
+2026-07-25T19:33:13.205285251Z [err]      at async /app/server.js:166:19

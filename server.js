@@ -101,17 +101,28 @@ async function getAllLeadCustomFields() {
   return data?._embedded?.custom_fields || [];
 }
 
-function findFieldByKeywords(fields, keywords) {
-  return fields.find(f => {
-    const name = (f.name || '').toLowerCase();
-    return keywords.some(k => name.includes(k));
-  });
+const norm = (x) => String(x || '').trim().toLowerCase();
+
+/**
+ * Подбор поля amoCRM.
+ *  1) сначала пробуем точное совпадение названия
+ *  2) потом вхождение подстроки, но ПРИОРИТЕТ отдаём полю нужного типа
+ * Это важно: в кабинете есть и "Согласие: информационные рассылки" (флаг),
+ * и старое "РЕКЛАМНАЯ_РАССЫЛКА" (текст). Раньше код цеплял текстовое и падал.
+ */
+function pickField(fields, { exact = [], includes = [], preferType = 'checkbox' }) {
+  for (const wanted of exact) {
+    const hit = fields.find(f => norm(f.name) === norm(wanted));
+    if (hit) return hit;
+  }
+  const matched = fields.filter(f => includes.some(k => norm(f.name).includes(norm(k))));
+  return matched.find(f => f.type === preferType) || matched[0] || null;
 }
 
 async function createCheckboxField(name) {
   const body = [{ type: 'checkbox', name }];
   const created = await amoFetch('/leads/custom_fields', { method: 'POST', body: JSON.stringify(body) });
-  return created._embedded.custom_fields[0].id;
+  return created._embedded.custom_fields[0];
 }
 
 async function resolveLeadFields() {
@@ -119,45 +130,75 @@ async function resolveLeadFields() {
 
   const fields = await getAllLeadCustomFields();
 
-  const media = findFieldByKeywords(fields, ['фото', 'видео']);
-  const mailing = findFieldByKeywords(fields, ['рассылк', 'информацион']);
-  const pd = findFieldByKeywords(fields, ['персональных', 'перс. д', 'обработку перс']);
-  let wantsRazbor = findFieldByKeywords(fields, ['роль', 'участ', 'разбор']);
+  const media = pickField(fields, {
+    exact: ['Согласие: фото/видео для кейса'],
+    includes: ['согласие: фото', 'фото/видео', 'фото', 'видео'],
+  });
 
-  const mediaFieldId = media?.id || null;
-  const mailingFieldId = mailing?.id || null;
-  const pdFieldId = pd?.id || null;
+  const mailing = pickField(fields, {
+    exact: ['Согласие: информационные рассылки'],
+    includes: ['согласие: информацион', 'информацион', 'рассылк'],
+  });
 
-  // поля "хочет разбор" ещё нет в amoCRM — создаём один раз автоматически
-  let wantsRazborFieldId = wantsRazbor?.id || null;
-  if (!wantsRazborFieldId) {
-    wantsRazborFieldId = await createCheckboxField('Хочет, чтобы разобрали бизнес (сайт)');
-    console.log('Создано новое поле в amoCRM: "Хочет, чтобы разобрали бизнес (сайт)", id =', wantsRazborFieldId);
+  const pd = pickField(fields, {
+    exact: ['Согласие: обработка перс. данных'],
+    includes: ['согласие: обработка перс', 'перс. д', 'персональн'],
+  });
+
+  let wantsRazbor = pickField(fields, {
+    exact: ['Хочет, чтобы разобрали бизнес (сайт)'],
+    includes: ['разобрали', 'хочет, чтобы разобрал'],
+  });
+
+  // создаём поле ТОЛЬКО если его действительно нет.
+  // (раньше искали по подстроке "разбор", а в названии "разобрали" — её нет,
+  //  поэтому поле пересоздавалось при каждом рестарте и плодило дубли)
+  if (!wantsRazbor) {
+    wantsRazbor = await createCheckboxField('Хочет, чтобы разобрали бизнес (сайт)');
+    console.log('Создано новое поле в amoCRM: "Хочет, чтобы разобрали бизнес (сайт)", id =', wantsRazbor.id);
   }
 
-  leadFieldsCache = { mediaFieldId, mailingFieldId, pdFieldId, wantsRazborFieldId };
-  console.log('Резолв полей сделки:', leadFieldsCache, {
-    mediaField: media?.name, mailingField: mailing?.name, pdField: pd?.name, wantsRazborField: wantsRazbor?.name,
+  leadFieldsCache = { media, mailing, pd, wantsRazbor };
+  console.log('Резолв полей сделки:', {
+    media:       media       && `${media.name} (id ${media.id}, ${media.type})`,
+    mailing:     mailing     && `${mailing.name} (id ${mailing.id}, ${mailing.type})`,
+    pd:          pd          && `${pd.name} (id ${pd.id}, ${pd.type})`,
+    wantsRazbor: wantsRazbor && `${wantsRazbor.name} (id ${wantsRazbor.id}, ${wantsRazbor.type})`,
   });
   return leadFieldsCache;
 }
 
-function buildLeadCustomFields({ mediaFieldId, mailingFieldId, pdFieldId, wantsRazborFieldId }, payload) {
-  const out = [];
-  if (mediaFieldId) {
-    out.push({ field_id: mediaFieldId, values: [{ value: payload.consent_media === 'Да' }] });
+/**
+ * Готовит одно значение под РЕАЛЬНЫЙ тип поля в amoCRM.
+ *  checkbox            -> булево true/false
+ *  select/radiobutton  -> enum_id варианта "Да"/"Нет"
+ *  всё остальное       -> строка 'Да'/'Нет'
+ * Именно из-за этого раньше прилетало 400 InvalidType.
+ */
+function cfEntry(field, boolValue) {
+  if (!field) return null;
+  const on = Boolean(boolValue);
+
+  if (field.type === 'checkbox') {
+    return { field_id: field.id, values: [{ value: on }] };
   }
-  if (mailingFieldId) {
-    out.push({ field_id: mailingFieldId, values: [{ value: payload.consent_mailing === 'Да' }] });
+
+  if (field.type === 'select' || field.type === 'radiobutton') {
+    const wanted = on ? ['да', 'yes'] : ['нет', 'no'];
+    const hit = (field.enums || []).find(e => wanted.includes(norm(e.value)));
+    if (hit) return { field_id: field.id, values: [{ enum_id: hit.id }] };
   }
-  if (pdFieldId) {
-    out.push({ field_id: pdFieldId, values: [{ value: payload.consent_pd === 'Да' }] });
-  }
-  if (wantsRazborFieldId) {
-    const wantsRazbor = (payload.role || '').includes('разобрали');
-    out.push({ field_id: wantsRazborFieldId, values: [{ value: wantsRazbor }] });
-  }
-  return out;
+
+  return { field_id: field.id, values: [{ value: on ? 'Да' : 'Нет' }] };
+}
+
+function buildLeadCustomFields({ media, mailing, pd, wantsRazbor }, payload) {
+  return [
+    cfEntry(media,       payload.consent_media   === 'Да'),
+    cfEntry(mailing,     payload.consent_mailing === 'Да'),
+    cfEntry(pd,          payload.consent_pd      === 'Да'),
+    cfEntry(wantsRazbor, String(payload.role || '').includes('разобрали')),
+  ].filter(Boolean);
 }
 
 function normalizePhone(raw) {
@@ -231,7 +272,38 @@ async function addNoteToLead(leadId, text) {
 // Google Sheets helpers
 // ========================================================================
 
+/**
+ * Railway часто сохраняет ключ в кавычках и/или с литеральными \n.
+ * Node ждёт настоящие переносы строк — иначе ловим
+ * "error:1E08010C:DECODER routines::unsupported".
+ */
+function normalizePrivateKey(raw) {
+  if (!raw) return raw;
+  let key = String(raw).trim();
+  if ((key.startsWith('"') && key.endsWith('"')) || (key.startsWith("'") && key.endsWith("'"))) {
+    key = key.slice(1, -1);
+  }
+  key = key.replace(/\\n/g, '\n').replace(/\r/g, '');
+  return key.endsWith('\n') ? key : key + '\n';
+}
+
 const sheetsEnabled = Boolean(GOOGLE_SERVICE_ACCOUNT_EMAIL && GOOGLE_PRIVATE_KEY && GOOGLE_SHEET_ID);
+
+// диагностика ключа при старте — чтобы не гадать
+if (sheetsEnabled) {
+  const k = normalizePrivateKey(GOOGLE_PRIVATE_KEY);
+  const okHead = k.startsWith('-----BEGIN PRIVATE KEY-----');
+  const okTail = k.trim().endsWith('-----END PRIVATE KEY-----');
+  console.log('Google ключ:', {
+    длина: k.length,
+    переносов: (k.match(/\n/g) || []).length,
+    началоОК: okHead,
+    конецОК: okTail,
+  });
+  if (!okHead || !okTail) {
+    console.error('ВНИМАНИЕ: GOOGLE_PRIVATE_KEY выглядит битым. Проверь переменную в Railway.');
+  }
+}
 let sheetsClientPromise = null;
 
 async function getSheetsClient() {
@@ -240,7 +312,7 @@ async function getSheetsClient() {
     const auth = new google.auth.GoogleAuth({
       credentials: {
         client_email: GOOGLE_SERVICE_ACCOUNT_EMAIL,
-        private_key: GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+        private_key: normalizePrivateKey(GOOGLE_PRIVATE_KEY),
       },
       scopes: ['https://www.googleapis.com/auth/spreadsheets'],
     });

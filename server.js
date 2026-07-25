@@ -82,6 +82,50 @@ async function resolvePipelineAndStage() {
   return pipelineCache;
 }
 
+// кэшируем ID кастомных полей сделки (согласия), чтобы не спрашивать каждый раз
+let consentFieldsCache = null;
+
+async function resolveConsentFields() {
+  if (consentFieldsCache) return consentFieldsCache;
+
+  const data = await amoFetch('/leads/custom_fields?limit=250');
+  const fields = data._embedded?.custom_fields || [];
+
+  const findByKeywords = (keywords) =>
+    fields.find(f => {
+      const name = (f.name || '').toLowerCase();
+      return keywords.some(k => name.includes(k));
+    });
+
+  const media = findByKeywords(['фото', 'видео']);
+  const mailing = findByKeywords(['рассылк', 'информацион']);
+  const pd = findByKeywords(['персональных', 'перс. д', 'обработку перс']);
+
+  consentFieldsCache = {
+    mediaFieldId: media?.id || null,
+    mailingFieldId: mailing?.id || null,
+    pdFieldId: pd?.id || null,
+  };
+  console.log('Резолв полей согласий:', consentFieldsCache, {
+    mediaField: media?.name, mailingField: mailing?.name, pdField: pd?.name,
+  });
+  return consentFieldsCache;
+}
+
+function buildConsentCustomFields({ mediaFieldId, mailingFieldId, pdFieldId }, payload) {
+  const out = [];
+  if (mediaFieldId) {
+    out.push({ field_id: mediaFieldId, values: [{ value: payload.consent_media === 'Да' }] });
+  }
+  if (mailingFieldId) {
+    out.push({ field_id: mailingFieldId, values: [{ value: payload.consent_mailing === 'Да' }] });
+  }
+  if (pdFieldId) {
+    out.push({ field_id: pdFieldId, values: [{ value: payload.consent_pd === 'Да' }] });
+  }
+  return out;
+}
+
 function normalizePhone(raw) {
   return (raw || '').replace(/[^\d+]/g, '');
 }
@@ -113,12 +157,13 @@ async function createContact({ name, phone, telegram }) {
   return data._embedded.contacts[0];
 }
 
-async function createLead({ name, phone, contactId, pipelineId, statusId }) {
+async function createLead({ name, phone, contactId, pipelineId, statusId, customFields }) {
   const body = [{
     name: `Заявка: ${name || 'Без имени'}${phone ? ', ' + phone : ''}`,
     pipeline_id: pipelineId,
     status_id: statusId,
     _embedded: contactId ? { contacts: [{ id: contactId }] } : undefined,
+    custom_fields_values: customFields && customFields.length ? customFields : undefined,
   }];
   const data = await amoFetch('/leads', { method: 'POST', body: JSON.stringify(body) });
   return data._embedded.leads[0];
@@ -161,6 +206,7 @@ app.post('/webhook/razbory', async (req, res) => {
     const phone = normalizePhone(payload.phone);
 
     const { pipelineId, statusId } = await resolvePipelineAndStage();
+    const consentFields = await resolveConsentFields();
 
     // ищем существующий контакт по телефону, иначе создаём новый
     let contact = await findContactByPhone(phone);
@@ -174,6 +220,7 @@ app.post('/webhook/razbory', async (req, res) => {
       contactId: contact?.id,
       pipelineId,
       statusId,
+      customFields: buildConsentCustomFields(consentFields, payload),
     });
 
     await addNoteToLead(lead.id, buildNoteText({ ...payload, phone }));

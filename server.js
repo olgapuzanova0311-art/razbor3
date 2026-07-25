@@ -205,13 +205,50 @@ function normalizePhone(raw) {
   return (raw || '').replace(/[^\d+]/g, '');
 }
 
+/**
+ * Последние 10 цифр номера — по ним и сверяем.
+ * +7 (999) 123-45-67, 89991234567, 79991234567 -> 9991234567
+ */
+function phoneDigits(raw) {
+  const d = String(raw || '').replace(/\D/g, '');
+  return d.length >= 10 ? d.slice(-10) : d;
+}
+
+function contactPhones(contact) {
+  const out = [];
+  for (const f of contact.custom_fields_values || []) {
+    if (f.field_code === 'PHONE') {
+      for (const v of f.values || []) out.push(phoneDigits(v.value));
+    }
+  }
+  return out;
+}
+
+/**
+ * ВАЖНО: amoCRM ищет по ПОДСТРОКЕ, а не по точному совпадению.
+ * Номер "999999" находил контакт с номером +7 (999) 999-99-99 и сделка
+ * привязывалась к чужому человеку. Поэтому:
+ *  1) короткие/мусорные номера не ищем вообще
+ *  2) результаты поиска перепроверяем на точное совпадение номера
+ */
 async function findContactByPhone(phone) {
-  if (!phone) return null;
-  const query = encodeURIComponent(phone);
-  const data = await amoFetch(`/contacts?query=${query}&with=leads`);
+  const target = phoneDigits(phone);
+
+  if (target.length < 10) {
+    console.log(`Номер "${phone}" короче 10 цифр — поиск контакта пропущен, создаём новый`);
+    return null;
+  }
+
+  const data = await amoFetch(`/contacts?query=${encodeURIComponent(target)}`);
   if (!data) return null;
+
   const contacts = data._embedded?.contacts || [];
-  return contacts[0] || null;
+  const exact = contacts.find(c => contactPhones(c).includes(target));
+
+  if (!exact && contacts.length) {
+    console.log(`Найдено ${contacts.length} похожих контактов по "${target}", но точного совпадения нет — создаём новый`);
+  }
+  return exact || null;
 }
 
 async function createContact({ name, phone }) {

@@ -409,6 +409,7 @@ async function logLeadToSheet(payload, leadId) {
     payload.consent_pd || '',
     payload.page || '',
     leadId || '',
+    payload.rid || '',
   ]);
 }
 
@@ -433,6 +434,41 @@ async function logBotEvent({ chatId, username, direction, text, presentation }) 
     lead ? (lead.phone || '') : '—',
     presentation ? `${presentation.type}: ${presentation.label}` : '',
   ]);
+}
+
+/**
+ * Ищем заявку в листе «Заявки» по коду rid.
+ * Нужно, чтобы связка не терялась при перезапуске контейнера:
+ * память очищается, а таблица — нет.
+ */
+async function findLeadInSheetByRid(rid) {
+  if (!sheetsEnabled || !rid) return null;
+  try {
+    const sheets = await getSheetsClient();
+    const res = await sheets.spreadsheets.values.get({
+      spreadsheetId: GOOGLE_SHEET_ID,
+      range: `${GOOGLE_SHEET_TAB_LEADS}!A:K`,
+    });
+    const rows = res.data.values || [];
+    // ищем с конца — свежие заявки внизу
+    for (let i = rows.length - 1; i >= 1; i--) {
+      const r = rows[i];
+      if (String(r[10] || '').trim() !== rid) continue;
+      return {
+        name: r[1] || '',
+        phone: r[2] || '',
+        role: r[4] || '',
+        wantsRazbor: String(r[4] || '').includes('разобрали'),
+        consentMailing: String(r[6] || '').trim() === 'Да',
+        leadId: r[9] || '',
+        rid,
+        arrived: true,
+      };
+    }
+  } catch (err) {
+    console.error('Не удалось найти заявку в таблице по коду:', err.message || err);
+  }
+  return null;
 }
 
 /* ---------- База подписчиков бота (для будущих рассылок) ---------- */
@@ -488,6 +524,25 @@ app.post('/webhook/razbory', async (req, res) => {
   try {
     const payload = req.body || {};
     const phone = normalizePhone(payload.phone);
+    const rid = String(payload.rid || '').trim();
+
+    /* ВАЖНО: заявку кладём в память ПЕРВЫМ делом.
+       Сайт уводит человека в бота мгновенно, а amoCRM отвечает 3-4 секунды.
+       Если ждать сделку, /start успевает прийти раньше — и связка теряется. */
+    const leadRecord = {
+      name: payload.name,
+      phone,
+      role: payload.role || '',
+      wantsRazbor: String(payload.role || '').includes('разобрали'),
+      consentMailing: payload.consent_mailing === 'Да',
+      telegramFromForm: payload.telegram || '',
+      leadId: null,          // проставится, когда сделка создастся
+      rid,
+      at: Date.now(),
+      arrived: false,
+    };
+    pendingLeads.set(phoneDigits(phone), leadRecord);
+    if (rid) leadByRid.set(rid, leadRecord);
 
     const { pipelineId, statusId } = await resolvePipelineAndStage();
     const leadFields = await resolveLeadFields();
@@ -514,17 +569,7 @@ app.post('/webhook/razbory', async (req, res) => {
 
     // ЭТАП 1 — заполнил форму на сайте
     const key = phoneDigits(phone);
-    pendingLeads.set(key, {
-      name: payload.name,
-      phone,
-      role: payload.role || '',
-      wantsRazbor: String(payload.role || '').includes('разобрали'),
-      consentMailing: payload.consent_mailing === 'Да',
-      telegramFromForm: payload.telegram || '',
-      leadId: lead.id,
-      at: Date.now(),
-      arrived: false,
-    });
+    leadRecord.leadId = lead.id;   // объект тот же, что уже лежит в памяти
 
     const roleLine = payload.role ? `\nРоль: ${esc(payload.role)}` : '';
     notifyAdmin([
@@ -574,6 +619,8 @@ const pendingLeads = new Map();
 const botArrivals = new Map();
 // chatId -> заявка с сайта (чтобы Bot-лог знал, хочет ли человек разбор)
 const leadByChat = new Map();
+// rid (код заявки из ссылки) -> заявка. Даёт ТОЧНОЕ сопоставление вместо угадывания по времени
+const leadByRid = new Map();
 
 let notifyBot = null;               // проставится ниже, когда поднимется бот
 function setNotifyBot(b) { notifyBot = b; }
@@ -680,9 +727,30 @@ if (TELEGRAM_BOT_TOKEN) {
 
     // связываем с заявкой ДО записи в лог, иначе первая строка уйдёт без данных
     let matched = null;
+    let matchKind = '';
     if (!leadByChat.has(chatId)) {
-      for (const [k, v] of pendingLeads) {
-        if (!v.arrived) { matched = { k, v }; }
+      // 1) точное совпадение по коду заявки из ссылки — самый надёжный путь.
+      //    Человек может нажать /start раньше, чем долетит вебхук с сайта,
+      //    поэтому ждём его до 8 секунд.
+      if (payload) {
+        for (let i = 0; i < 16 && !leadByRid.has(payload); i++) {
+          await new Promise(r => setTimeout(r, 500));
+        }
+        if (leadByRid.has(payload)) {
+          matched = { v: leadByRid.get(payload) };
+          matchKind = 'по коду заявки';
+        }
+      }
+      // 2) заявка из таблицы (переживает перезапуск Railway)
+      if (!matched && payload) {
+        const fromSheet = await findLeadInSheetByRid(payload);
+        if (fromSheet) { matched = { v: fromSheet }; matchKind = 'по коду из таблицы'; }
+      }
+      // 3) запасной вариант — последняя незакрытая заявка (может ошибиться)
+      if (!matched) {
+        for (const [k, v] of pendingLeads) {
+          if (!v.arrived) { matched = { k, v }; matchKind = 'приблизительно, по времени'; }
+        }
       }
       if (matched) {
         matched.v.arrived = true;
@@ -703,12 +771,12 @@ if (TELEGRAM_BOT_TOKEN) {
         payload ? `Метка: <code>${esc(payload)}</code>` : `Метка: <i>нет (зашёл не с сайта)</i>`,
         ``,
         matched
-          ? `Вероятно, это заявка: <b>${esc(matched.v.name)}</b>, <code>${esc(matched.v.phone)}</code>\nСделка: https://${AMO_BASE_DOMAIN}/leads/detail/${matched.v.leadId}`
+          ? `Заявка (${esc(matchKind)}): <b>${esc(matched.v.name)}</b>, <code>${esc(matched.v.phone)}</code>\nСделка: https://${AMO_BASE_DOMAIN}/leads/detail/${matched.v.leadId}`
           : `<i>Заявку с сайта сопоставить не удалось.</i>`,
       ].filter(Boolean).join('\n'));
     }
 
-    if (payload === 'razbory') {
+    if (payload) {   // пришёл по ссылке с сайта (код заявки или метка razbory)
       const welcomeText = [
         `Вы зарегистрированы на «Нетворкинг + бизнес-разборы от Александра» 🎉`,
         ``,

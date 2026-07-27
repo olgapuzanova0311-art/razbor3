@@ -474,14 +474,52 @@ async function findLeadInSheetByRid(rid) {
 /* ---------- База подписчиков бота (для будущих рассылок) ---------- */
 
 const knownSubscribers = new Set();
+// chatId -> номер строки в листе, чтобы дописать данные заявки позже
+const subscriberRow = new Map();
 let subsLoaded = false;
 
 async function loadSubscribers() {
   if (subsLoaded) return;
   subsLoaded = true;
   const ids = await readSheetColumn(GOOGLE_SHEET_TAB_SUBS, 'B');
-  ids.forEach(id => knownSubscribers.add(String(id)));
+  ids.forEach((id, i) => {
+    const clean = String(id).trim();
+    if (!clean || clean.toLowerCase().includes('chat')) return;  // пропускаем заголовок
+    knownSubscribers.add(clean);
+    subscriberRow.set(clean, i + 1);   // readSheetColumn отдаёт с первой строки
+  });
   console.log(`База бота: загружено ${knownSubscribers.size} записей`);
+}
+
+/**
+ * Дописываем данные заявки в уже существующую строку.
+ * Нужно, когда человек попал в базу раньше, чем появилась его заявка.
+ */
+async function updateSubscriberLead(chatId, lead) {
+  if (!sheetsEnabled || !lead) return;
+  const row = subscriberRow.get(String(chatId));
+  if (!row) return;
+
+  try {
+    const sheets = await getSheetsClient();
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: GOOGLE_SHEET_ID,
+      range: `${GOOGLE_SHEET_TAB_SUBS}!F${row}:J${row}`,
+      valueInputOption: 'USER_ENTERED',
+      requestBody: {
+        values: [[
+          lead.name || '',
+          lead.phone || '',
+          lead.wantsRazbor ? 'Да' : 'Нет',
+          lead.consentMailing ? 'Да' : 'Нет',
+          lead.leadId || '',
+        ]],
+      },
+    });
+    console.log(`База бота: обновлена строка ${row} для ${chatId}`);
+  } catch (err) {
+    console.error('Не удалось обновить строку в Базе бота:', err.message || err);
+  }
 }
 
 /**
@@ -492,11 +530,15 @@ async function registerSubscriber(msg) {
   await loadSubscribers();
 
   const chatId = String(msg.chat.id);
-  if (knownSubscribers.has(chatId)) return false;
-  knownSubscribers.add(chatId);
-
   const from = msg.from || {};
   const lead = leadByChat.get(msg.chat.id) || null;
+
+  // человек уже в базе — новую строку не плодим, но данные заявки дописываем
+  if (knownSubscribers.has(chatId)) {
+    if (lead) await updateSubscriberLead(chatId, lead);
+    return false;
+  }
+  knownSubscribers.add(chatId);
 
   await appendSheetRow(GOOGLE_SHEET_TAB_SUBS, [
     nowMoscow(),                                   // A: когда пришёл
@@ -511,6 +553,10 @@ async function registerSubscriber(msg) {
     lead ? (lead.leadId || '') : '',               // J: сделка в amo
     '',                                            // K: заблокировал бота (ставится при рассылке)
   ]);
+
+  // запоминаем, в какую строку попали (для будущих обновлений)
+  const ids = await readSheetColumn(GOOGLE_SHEET_TAB_SUBS, 'B');
+  subscriberRow.set(chatId, ids.length);
 
   console.log(`База бота: добавлен ${chatId} (@${from.username || '—'})`);
   return true;

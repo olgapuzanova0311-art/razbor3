@@ -26,6 +26,7 @@ const {
   STAGE_NAME,                // "Первичный контакт" (первый этап воронки)
   ALLOWED_ORIGIN,            // опционально: домен сайта, для ограничения CORS
   TELEGRAM_BOT_TOKEN,        // токен бота из BotFather (перевыпущенный!)
+  ADMIN_CHAT_IDS,            // кому слать уведомления, через запятую
   GOOGLE_SERVICE_ACCOUNT_EMAIL, // email сервисного аккаунта Google
   GOOGLE_PRIVATE_KEY,        // приватный ключ сервисного аккаунта (с \n внутри)
   GOOGLE_SHEET_ID,           // ID таблицы (из её URL)
@@ -436,11 +437,87 @@ app.post('/webhook/razbory', async (req, res) => {
 
     console.log(`OK: сделка #${lead.id} создана для ${payload.name} (${phone})`);
     res.json({ ok: true, lead_id: lead.id });
+
+    // ЭТАП 1 — заполнил форму на сайте
+    const key = phoneDigits(phone);
+    pendingLeads.set(key, {
+      name: payload.name,
+      phone,
+      leadId: lead.id,
+      at: Date.now(),
+      arrived: false,
+    });
+
+    const roleLine = payload.role ? `\nРоль: ${esc(payload.role)}` : '';
+    notifyAdmin([
+      `🟠 <b>ЭТАП 1 — заявка с сайта</b>`,
+      ``,
+      `Имя: <b>${esc(payload.name)}</b>`,
+      `Телефон: <code>${esc(phone)}</code>`,
+      payload.telegram ? `Telegram: ${esc(payload.telegram)}` : '',
+      roleLine.trim(),
+      ``,
+      `Сделка: https://${AMO_BASE_DOMAIN}/leads/detail/${lead.id}`,
+      ``,
+      `<i>Ждём перехода в бота…</i>`,
+    ].filter(Boolean).join('\n'));
+
+    // если через 10 минут человек не дошёл до бота — сообщаем
+    setTimeout(() => {
+      const rec = pendingLeads.get(key);
+      if (rec && !rec.arrived) {
+        notifyAdmin([
+          `⚠️ <b>Не дошёл до бота</b>`,
+          ``,
+          `<b>${esc(rec.name)}</b>, <code>${esc(rec.phone)}</code>`,
+          `Прошло 10 минут после заявки, в бот не заходил.`,
+          ``,
+          `Сделка: https://${AMO_BASE_DOMAIN}/leads/detail/${rec.leadId}`,
+        ].join('\n'));
+      }
+    }, 10 * 60 * 1000);
   } catch (err) {
     console.error('Ошибка обработки заявки:', err);
     res.status(500).json({ ok: false, error: 'internal_error' });
   }
 });
+
+// ========================================================================
+// Уведомления администратору о движении заявок
+// ========================================================================
+
+const ADMINS = String(ADMIN_CHAT_IDS || '')
+  .split(',').map(x => x.trim()).filter(Boolean);
+
+// сюда складываем заявки с сайта, чтобы связать их с приходом в бота
+// ключ — последние 10 цифр телефона
+const pendingLeads = new Map();
+// кто уже дошёл до бота: chatId -> данные
+const botArrivals = new Map();
+
+let notifyBot = null;               // проставится ниже, когда поднимется бот
+function setNotifyBot(b) { notifyBot = b; }
+
+async function notifyAdmin(text) {
+  if (!notifyBot || !ADMINS.length) return;
+  for (const id of ADMINS) {
+    try {
+      await notifyBot.sendMessage(id, text, {
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+      });
+    } catch (err) {
+      console.error(`Не удалось отправить уведомление на ${id}:`, err.message || err);
+    }
+  }
+}
+
+const esc = (v) => String(v ?? '')
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+function tgLink(username, chatId) {
+  return username ? `@${esc(username)}` : `<a href="tg://user?id=${chatId}">чат</a>`;
+}
 
 // health-check для Railway
 app.get('/', (req, res) => res.send('razbory-service is running'));
@@ -469,6 +546,39 @@ if (TELEGRAM_BOT_TOKEN) {
 
     await logBotEvent({ chatId, username, direction: 'in', text: `/start ${payload}`.trim() });
 
+    // ЭТАП 2 — дошёл до бота
+    const already = botArrivals.has(chatId);
+    botArrivals.set(chatId, {
+      name: firstName,
+      username,
+      at: Date.now(),
+      messages: already ? botArrivals.get(chatId).messages : 0,
+    });
+
+    if (!already) {
+      // пробуем связать с заявкой: ищем самую свежую незакрытую
+      let matched = null;
+      for (const [k, v] of pendingLeads) {
+        if (!v.arrived) { matched = { k, v }; }
+      }
+      if (matched) {
+        matched.v.arrived = true;
+        matched.v.chatId = chatId;
+      }
+
+      notifyAdmin([
+        `🟢 <b>ЭТАП 2 — перешёл в бота</b>`,
+        ``,
+        `Имя в Telegram: <b>${esc(firstName)}</b>`,
+        `Профиль: ${tgLink(username, chatId)}`,
+        payload ? `Метка: <code>${esc(payload)}</code>` : `Метка: <i>нет (зашёл не с сайта)</i>`,
+        ``,
+        matched
+          ? `Вероятно, это заявка: <b>${esc(matched.v.name)}</b>, <code>${esc(matched.v.phone)}</code>\nСделка: https://${AMO_BASE_DOMAIN}/leads/detail/${matched.v.leadId}`
+          : `<i>Заявку с сайта сопоставить не удалось.</i>`,
+      ].filter(Boolean).join('\n'));
+    }
+
     if (payload === 'razbory') {
       const welcomeText = [
         `${firstName ? firstName + ', ' : ''}вы зарегистрированы на «Открытые разборы бизнеса» 🎉`,
@@ -487,19 +597,47 @@ if (TELEGRAM_BOT_TOKEN) {
   bot.on('message', async (msg) => {
     // сообщения /start уже залогированы выше отдельно — не дублируем
     if (msg.text && msg.text.startsWith('/start')) return;
-    await logBotEvent({
-      chatId: msg.chat.id,
-      username: msg.from?.username,
-      direction: 'in',
-      text: msg.text || '[не текстовое сообщение]',
-    });
+    const chatId = msg.chat.id;
+    const username = msg.from?.username;
+    const text = msg.text || '[не текстовое сообщение]';
+
+    await logBotEvent({ chatId, username, direction: 'in', text });
+
+    // ЭТАП 3 — написал в бота
+    const rec = botArrivals.get(chatId) || { name: msg.from?.first_name || '', messages: 0 };
+    rec.messages = (rec.messages || 0) + 1;
+    rec.username = username;
+    botArrivals.set(chatId, rec);
+
+    // админам собственные сообщения не пересылаем
+    if (ADMINS.includes(String(chatId))) return;
+
+    notifyAdmin([
+      `💬 <b>ЭТАП 3 — написал в бота</b>`,
+      ``,
+      `От: <b>${esc(rec.name)}</b> ${tgLink(username, chatId)}`,
+      `Сообщение №${rec.messages}`,
+      ``,
+      `<blockquote>${esc(text)}</blockquote>`,
+    ].join('\n'));
   });
 
   bot.on('polling_error', (err) => {
     console.error('Ошибка Telegram polling:', err.message || err);
   });
 
+  setNotifyBot(bot);
   console.log('Telegram-бот запущен (polling)');
+  if (ADMINS.length) {
+    console.log('Уведомления администраторам включены:', ADMINS.join(', '));
+  } else {
+    console.log('ADMIN_CHAT_IDS не задан — уведомления администраторам выключены');
+  }
+
+  // /whoami — узнать свой chat id прямо из этого бота
+  bot.onText(/\/whoami/, async (msg) => {
+    await bot.sendMessage(msg.chat.id, `Ваш chat id: ${msg.chat.id}`);
+  });
 } else {
   console.log('TELEGRAM_BOT_TOKEN не задан — бот отключён, работает только webhook для сайта');
 }

@@ -32,6 +32,7 @@ const {
   GOOGLE_SHEET_ID,           // ID таблицы (из её URL)
   GOOGLE_SHEET_TAB_LEADS = 'Заявки',
   GOOGLE_SHEET_TAB_BOTLOG = 'Bot-лог',
+  GOOGLE_SHEET_TAB_SUBS = 'База бота',
   PORT = 3000,
 } = process.env;
 
@@ -360,6 +361,21 @@ async function getSheetsClient() {
   return sheetsClientPromise;
 }
 
+async function readSheetColumn(tabName, columnLetter) {
+  if (!sheetsEnabled) return [];
+  try {
+    const sheets = await getSheetsClient();
+    const res = await sheets.spreadsheets.values.get({
+      spreadsheetId: GOOGLE_SHEET_ID,
+      range: `${tabName}!${columnLetter}:${columnLetter}`,
+    });
+    return (res.data.values || []).map(r => String(r[0] || '').trim()).filter(Boolean);
+  } catch (err) {
+    console.error(`Не удалось прочитать ${tabName}!${columnLetter}:`, err.message || err);
+    return [];
+  }
+}
+
 async function appendSheetRow(tabName, values) {
   if (!sheetsEnabled) return;
   try {
@@ -396,14 +412,72 @@ async function logLeadToSheet(payload, leadId) {
   ]);
 }
 
-async function logBotEvent({ chatId, username, direction, text }) {
+/**
+ * Пишем в Bot-лог. Колонки F-I подтягиваются из заявки с сайта,
+ * чтобы прямо в логе было видно, кто это и хочет ли он разбор.
+ * F: Хочет разбор (Да/Нет)   G: Роль участия
+ * H: Имя с сайта             I: Телефон
+ */
+async function logBotEvent({ chatId, username, direction, text, presentation }) {
+  const lead = leadByChat.get(chatId) || null;
+
   await appendSheetRow(GOOGLE_SHEET_TAB_BOTLOG, [
     nowMoscow(),
     chatId || '',
     username ? '@' + username : '',
     direction, // 'in' (от человека) или 'out' (от бота)
     text || '',
+    lead ? (lead.wantsRazbor ? 'Да' : 'Нет') : '—',
+    lead ? (lead.role || '') : '—',
+    lead ? (lead.name || '') : '—',
+    lead ? (lead.phone || '') : '—',
+    presentation ? `${presentation.type}: ${presentation.label}` : '',
   ]);
+}
+
+/* ---------- База подписчиков бота (для будущих рассылок) ---------- */
+
+const knownSubscribers = new Set();
+let subsLoaded = false;
+
+async function loadSubscribers() {
+  if (subsLoaded) return;
+  subsLoaded = true;
+  const ids = await readSheetColumn(GOOGLE_SHEET_TAB_SUBS, 'B');
+  ids.forEach(id => knownSubscribers.add(String(id)));
+  console.log(`База бота: загружено ${knownSubscribers.size} записей`);
+}
+
+/**
+ * Один человек — одна строка. Повторные /start не плодят дублей.
+ * Список читается из таблицы при старте, поэтому переживает перезапуск.
+ */
+async function registerSubscriber(msg) {
+  await loadSubscribers();
+
+  const chatId = String(msg.chat.id);
+  if (knownSubscribers.has(chatId)) return false;
+  knownSubscribers.add(chatId);
+
+  const from = msg.from || {};
+  const lead = leadByChat.get(msg.chat.id) || null;
+
+  await appendSheetRow(GOOGLE_SHEET_TAB_SUBS, [
+    nowMoscow(),                                   // A: когда пришёл
+    chatId,                                        // B: chat id (по нему шлём рассылку)
+    from.username ? '@' + from.username : '',      // C: ник
+    [from.first_name, from.last_name].filter(Boolean).join(' '), // D: имя в telegram
+    from.language_code || '',                      // E: язык
+    lead ? (lead.name || '') : '',                 // F: имя с сайта
+    lead ? (lead.phone || '') : '',                // G: телефон
+    lead ? (lead.wantsRazbor ? 'Да' : 'Нет') : '', // H: хочет разбор
+    lead ? (lead.consentMailing ? 'Да' : 'Нет') : '', // I: СОГЛАСИЕ НА РАССЫЛКУ
+    lead ? (lead.leadId || '') : '',               // J: сделка в amo
+    '',                                            // K: заблокировал бота (ставится при рассылке)
+  ]);
+
+  console.log(`База бота: добавлен ${chatId} (@${from.username || '—'})`);
+  return true;
 }
 
 // ========================================================================
@@ -443,6 +517,10 @@ app.post('/webhook/razbory', async (req, res) => {
     pendingLeads.set(key, {
       name: payload.name,
       phone,
+      role: payload.role || '',
+      wantsRazbor: String(payload.role || '').includes('разобрали'),
+      consentMailing: payload.consent_mailing === 'Да',
+      telegramFromForm: payload.telegram || '',
       leadId: lead.id,
       at: Date.now(),
       arrived: false,
@@ -494,6 +572,8 @@ const ADMINS = String(ADMIN_CHAT_IDS || '')
 const pendingLeads = new Map();
 // кто уже дошёл до бота: chatId -> данные
 const botArrivals = new Map();
+// chatId -> заявка с сайта (чтобы Bot-лог знал, хочет ли человек разбор)
+const leadByChat = new Map();
 
 let notifyBot = null;               // проставится ниже, когда поднимется бот
 function setNotifyBot(b) { notifyBot = b; }
@@ -510,6 +590,48 @@ async function notifyAdmin(text) {
       console.error(`Не удалось отправить уведомление на ${id}:`, err.message || err);
     }
   }
+}
+
+/* Форматы, в которых реально присылают презентацию файлом */
+const PRESENTATION_EXT = /\.(pdf|pptx?|key|odp|docx?|pages|numbers|xlsx?)$/i;
+
+/* Облачные сервисы, ссылку на которые тоже считаем презентацией */
+const PRESENTATION_HOSTS = [
+  'docs.google.com', 'drive.google.com', 'slides.google.com',
+  'canva.com', 'figma.com', 'notion.so', 'notion.site',
+  'disk.yandex', 'yadi.sk', 'dropbox.com', 'onedrive.live.com',
+  '1drv.ms', 'icloud.com', 'cloud.mail.ru', 'miro.com',
+  'tildacdn', 'pitch.com', 'prezi.com', 'behance.net',
+];
+
+/**
+ * Определяем, прислал ли человек презентацию.
+ * Возвращает { type: 'файл' | 'ссылка' | 'фото', label } или null.
+ */
+function detectPresentation(msg, text, attachment) {
+  // 1) файл с подходящим расширением
+  if (msg.document) {
+    const name = msg.document.file_name || '';
+    if (PRESENTATION_EXT.test(name)) {
+      return { type: 'файл', label: name };
+    }
+    // расширение непонятное — всё равно помечаем, лучше лишний раз показать
+    return { type: 'файл', label: name || 'без имени' };
+  }
+
+  // 2) ссылка в тексте или подписи
+  const urls = String(text || '').match(/https?:\/\/[^\s<>"']+/gi) || [];
+  const hit = urls.find(u => PRESENTATION_HOSTS.some(h => u.toLowerCase().includes(h)));
+  if (hit) {
+    // ссылку на наш же шаблон за презентацию не считаем
+    if (hit.includes('1rIWmnSUM-y2krft7a8rA_9gZiZHshfEk')) return null;
+    return { type: 'ссылка', label: hit };
+  }
+
+  // 3) фото слайдов
+  if (msg.photo?.length) return { type: 'фото', label: 'фото слайдов' };
+
+  return null;
 }
 
 const esc = (v) => String(v ?? '')
@@ -530,6 +652,9 @@ app.listen(PORT, () => {
 // Telegram-бот: приветствие после /start + полный лог сообщений
 // ========================================================================
 
+const PRESENTATION_URL = 'https://docs.google.com/presentation/d/1rIWmnSUM-y2krft7a8rA_9gZiZHshfEk/edit?slide=id.g801c28a6de_0_6#slide=id.g801c28a6de_0_6';
+const ZOOM_URL = 'https://us06web.zoom.us/j/84924080690';
+
 if (TELEGRAM_BOT_TOKEN) {
   const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
 
@@ -544,8 +669,6 @@ if (TELEGRAM_BOT_TOKEN) {
     const firstName = msg.from?.first_name || '';
     const payload = match?.[1] || '';
 
-    await logBotEvent({ chatId, username, direction: 'in', text: `/start ${payload}`.trim() });
-
     // ЭТАП 2 — дошёл до бота
     const already = botArrivals.has(chatId);
     botArrivals.set(chatId, {
@@ -555,17 +678,23 @@ if (TELEGRAM_BOT_TOKEN) {
       messages: already ? botArrivals.get(chatId).messages : 0,
     });
 
-    if (!already) {
-      // пробуем связать с заявкой: ищем самую свежую незакрытую
-      let matched = null;
+    // связываем с заявкой ДО записи в лог, иначе первая строка уйдёт без данных
+    let matched = null;
+    if (!leadByChat.has(chatId)) {
       for (const [k, v] of pendingLeads) {
         if (!v.arrived) { matched = { k, v }; }
       }
       if (matched) {
         matched.v.arrived = true;
         matched.v.chatId = chatId;
+        leadByChat.set(chatId, matched.v);
       }
+    }
 
+    await registerSubscriber(msg);
+    await logBotEvent({ chatId, username, direction: 'in', text: `/start ${payload}`.trim() });
+
+    if (!already) {
       notifyAdmin([
         `🟢 <b>ЭТАП 2 — перешёл в бота</b>`,
         ``,
@@ -581,12 +710,18 @@ if (TELEGRAM_BOT_TOKEN) {
 
     if (payload === 'razbory') {
       const welcomeText = [
-        `${firstName ? firstName + ', ' : ''}вы зарегистрированы на «Открытые разборы бизнеса» 🎉`,
+        `Вы зарегистрированы на «Нетворкинг + бизнес-разборы от Александра» 🎉`,
         ``,
-        `Скоро с вами свяжется менеджер и пришлёт адрес встречи.`,
-        `Встреча пройдёт 30 июля в 19:00 в Санкт-Петербурге.`,
+        `Встреча пройдёт оффлайн 30 июля в 19:00 в Санкт-Петербурге.`,
+        ``,
+        `Если Вы хотите, чтобы Александр разобрал Ваш бизнес — заполняйте презентацию. Ссылка на шаблон (сделайте копию себе) 👉 ${PRESENTATION_URL}`,
+        ``,
+        `Также для всех, кто хочет, чтобы ему помогли ответить на вопросы по презентации — мы проведём zoom-встречу в среду 29 июля, в 20:00.`,
+        `Ссылка на Zoom 👉 ${ZOOM_URL} (Код 1)`,
+        ``,
+        `Готовую презентацию отправляйте в ответном сообщении сюда 📎`,
       ].join('\n');
-      await sendAndLog(chatId, username, welcomeText);
+      await sendAndLog(chatId, username, welcomeText, { disable_web_page_preview: true });
     } else {
       await sendAndLog(chatId, username, 'Привет! 👋');
     }
@@ -595,31 +730,96 @@ if (TELEGRAM_BOT_TOKEN) {
   // логируем вообще все входящие сообщения (не только /start) — чтобы было видно,
   // на каком этапе диалога находится человек и что он писал/получал
   bot.on('message', async (msg) => {
-    // сообщения /start уже залогированы выше отдельно — не дублируем
+    // /start обрабатывается отдельным хендлером выше — здесь только не дублируем лог
     if (msg.text && msg.text.startsWith('/start')) return;
+
     const chatId = msg.chat.id;
     const username = msg.from?.username;
-    const text = msg.text || '[не текстовое сообщение]';
 
-    await logBotEvent({ chatId, username, direction: 'in', text });
+    // человек мог написать боту, не нажимая /start — всё равно в базу
+    await registerSubscriber(msg);
 
-    // ЭТАП 3 — написал в бота
+    // ЛОВИМ ВСЁ: текст, файлы, фото, видео, голосовые, кружки, стикеры,
+    // геолокацию, контакты, опросы, аудио — ничего не отсеиваем
+    let text = msg.text || msg.caption || '';
+    let attachment = null;
+
+    if (msg.document) {
+      attachment = { kind: 'файл', name: msg.document.file_name || 'без имени' };
+    } else if (msg.photo?.length) {
+      attachment = { kind: 'фото', name: '' };
+    } else if (msg.video) {
+      attachment = { kind: 'видео', name: msg.video.file_name || '' };
+    } else if (msg.video_note) {
+      attachment = { kind: 'кружок', name: '' };
+    } else if (msg.voice) {
+      attachment = { kind: 'голосовое', name: `${msg.voice.duration || '?'} сек` };
+    } else if (msg.audio) {
+      attachment = { kind: 'аудио', name: msg.audio.file_name || msg.audio.title || '' };
+    } else if (msg.sticker) {
+      attachment = { kind: 'стикер', name: msg.sticker.emoji || '' };
+    } else if (msg.animation) {
+      attachment = { kind: 'гиф', name: '' };
+    } else if (msg.location) {
+      attachment = { kind: 'геолокация', name: `${msg.location.latitude}, ${msg.location.longitude}` };
+    } else if (msg.contact) {
+      attachment = { kind: 'контакт', name: `${msg.contact.first_name || ''} ${msg.contact.phone_number || ''}`.trim() };
+    } else if (msg.poll) {
+      attachment = { kind: 'опрос', name: msg.poll.question || '' };
+    } else if (msg.dice) {
+      attachment = { kind: 'кубик', name: String(msg.dice.value ?? '') };
+    }
+
+    if (attachment) {
+      const label = `[${attachment.kind}${attachment.name ? ': ' + attachment.name : ''}]`;
+      text = text ? `${label} ${text}` : label;
+    }
+    if (!text) text = '[сообщение без текста]';
+
+    // презентацию присылают по-разному — помечаем отдельно, но НЕ отсеиваем остальное
+    const presentation = detectPresentation(msg, text, attachment);
+
+    await logBotEvent({ chatId, username, direction: 'in', text, presentation });
+
     const rec = botArrivals.get(chatId) || { name: msg.from?.first_name || '', messages: 0 };
     rec.messages = (rec.messages || 0) + 1;
     rec.username = username;
     botArrivals.set(chatId, rec);
 
-    // админам собственные сообщения не пересылаем
-    if (ADMINS.includes(String(chatId))) return;
+    const lead = leadByChat.get(chatId);
 
-    notifyAdmin([
-      `💬 <b>ЭТАП 3 — написал в бота</b>`,
+    let header;
+    if (presentation) {
+      header = `📊 <b>Прислал презентацию (${esc(presentation.type)})</b>`;
+    } else if (attachment) {
+      header = `📎 <b>Прислал ${esc(attachment.kind)}</b>`;
+    } else {
+      header = `💬 <b>Написал в бота</b>`;
+    }
+
+    await notifyAdmin([
+      header,
       ``,
       `От: <b>${esc(rec.name)}</b> ${tgLink(username, chatId)}`,
+      lead ? `Заявка: ${esc(lead.name)}, <code>${esc(lead.phone)}</code>` : '',
+      lead ? `Хочет разбор: <b>${lead.wantsRazbor ? 'Да' : 'Нет'}</b>` : '',
+      lead ? `Сделка: https://${AMO_BASE_DOMAIN}/leads/detail/${lead.leadId}` : '',
       `Сообщение №${rec.messages}`,
+      presentation?.type === 'ссылка' ? `\nСсылка: ${esc(presentation.label)}` : '',
       ``,
       `<blockquote>${esc(text)}</blockquote>`,
-    ].join('\n'));
+    ].filter(Boolean).join('\n'));
+
+    // пересылаем оригинал администраторам — кроме сообщений самих администраторов
+    if (attachment && notifyBot && !ADMINS.includes(String(chatId))) {
+      for (const id of ADMINS) {
+        try {
+          await notifyBot.forwardMessage(id, chatId, msg.message_id);
+        } catch (err) {
+          console.error(`Не удалось переслать вложение на ${id}:`, err.message || err);
+        }
+      }
+    }
   });
 
   bot.on('polling_error', (err) => {
@@ -627,6 +827,7 @@ if (TELEGRAM_BOT_TOKEN) {
   });
 
   setNotifyBot(bot);
+  loadSubscribers();   // подтягиваем базу подписчиков при старте
   console.log('Telegram-бот запущен (polling)');
   if (ADMINS.length) {
     console.log('Уведомления администраторам включены:', ADMINS.join(', '));
